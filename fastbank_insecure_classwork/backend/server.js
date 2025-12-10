@@ -7,10 +7,42 @@ const crypto = require("crypto");
 
 const app = express();
 
-// --- BASIC CORS (clean, not vulnerable) ---
+/* ---------------- SECURE GLOBAL HEADERS (FIXES ZAP) ---------------- */
+
+// Remove X-Powered-By leak
+app.disable("x-powered-by");
+
+// No caching (fixes cacheable content alert)
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  next();
+});
+
+// Content Security Policy with full fallback
+app.use((req, res, next) => {
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'"
+  );
+  next();
+});
+
+// Permissions Policy header
+app.use((req, res, next) => {
+  res.setHeader(
+    "Permissions-Policy",
+    "geolocation=(), camera=(), microphone=(), fullscreen=()"
+  );
+  next();
+});
+
+/* ---------------- SAFE CORS ---------------- */
+
 app.use(
   cors({
-   origin: ["http://localhost:3001", "http://127.0.0.1:3001"],
+    origin: ["http://localhost:3001", "http://127.0.0.1:3001"],
     credentials: true
   })
 );
@@ -18,7 +50,8 @@ app.use(
 app.use(bodyParser.json());
 app.use(cookieParser());
 
-// --- IN-MEMORY SQLITE DB (clean) ---
+/* ---------------- DB ---------------- */
+
 const db = new sqlite3.Database(":memory:");
 
 db.serialize(() => {
@@ -51,13 +84,14 @@ db.serialize(() => {
   const passwordHash = crypto.createHash("sha256").update("password123").digest("hex");
 
   db.run(`INSERT INTO users (username, password_hash, email)
-          VALUES ('alice', '${passwordHash}', 'alice@example.com');`);
+          VALUES ('alice', ?, ?)`, [passwordHash, "alice@example.com"]);
 
   db.run(`INSERT INTO transactions (user_id, amount, description) VALUES (1, 25.50, 'Coffee shop')`);
   db.run(`INSERT INTO transactions (user_id, amount, description) VALUES (1, 100, 'Groceries')`);
 });
 
-// --- SESSION STORE (simple, predictable token exactly like assignment) ---
+/* ---------------- SESSION STORE ---------------- */
+
 const sessions = {};
 
 function fastHash(pwd) {
@@ -71,75 +105,77 @@ function auth(req, res, next) {
   next();
 }
 
-// ------------------------------------------------------------
-// Q4 — AUTH ISSUE 1 & 2: SHA256 fast hash + SQLi in username.
-// Q4 — AUTH ISSUE 3: Username enumeration.
-// Q4 — AUTH ISSUE 4: Predictable sessionId.
-// ------------------------------------------------------------
+/* ---------------- LOGIN (SAFE) ---------------- */
+
 app.post("/login", (req, res) => {
   const { username, password } = req.body;
 
-  const sql = `SELECT id, username, password_hash FROM users WHERE username = '${username}'`;
+  db.get(
+    `SELECT id, username, password_hash FROM users WHERE username = ?`,
+    [username],
+    (err, user) => {
+      if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
-  db.get(sql, (err, user) => {
-    if (!user) return res.status(404).json({ error: "Unknown username" });
+      const candidate = fastHash(password);
+      if (candidate !== user.password_hash) {
+        return res.status(401).json({ error: "Invalid credentials" });
+      }
 
-    const candidate = fastHash(password);
-    if (candidate !== user.password_hash) {
-      return res.status(401).json({ error: "Wrong password" });
+      const sid = crypto.randomBytes(32).toString("hex"); // secure session
+      sessions[sid] = { userId: user.id };
+
+      res.cookie("sid", sid, {
+        httpOnly: true,
+        secure: false,
+        sameSite: "strict"
+      });
+
+      res.json({ success: true });
     }
-
-    const sid = `${username}-${Date.now()}`; // predictable
-    sessions[sid] = { userId: user.id };
-
-    // Cookie is intentionally “normal” (not HttpOnly / secure)
-    res.cookie("sid", sid, {});
-
-    res.json({ success: true });
-  });
+  );
 });
 
-// ------------------------------------------------------------
-// /me — clean route, no vulnerabilities
-// ------------------------------------------------------------
+/* ---------------- PROFILE ---------------- */
+
 app.get("/me", auth, (req, res) => {
-  db.get(`SELECT username, email FROM users WHERE id = ${req.user.id}`, (err, row) => {
-    res.json(row);
-  });
+  db.get(
+    "SELECT username, email FROM users WHERE id = ?",
+    [req.user.id],
+    (err, row) => {
+      res.json(row);
+    }
+  );
 });
 
-// ------------------------------------------------------------
-// Q1 — SQLi in transaction search
-// ------------------------------------------------------------
+/* ---------------- TRANSACTIONS (SAFE SQL) ---------------- */
+
 app.get("/transactions", auth, (req, res) => {
-  const q = req.query.q || "";
-  const sql = `
+  const q = `%${req.query.q || ""}%`;
+
+  db.all(
+    `
     SELECT id, amount, description
     FROM transactions
-    WHERE user_id = ${req.user.id}
-      AND description LIKE '%${q}%'
+    WHERE user_id = ?
+      AND description LIKE ?
     ORDER BY id DESC
-  `;
-  db.all(sql, (err, rows) => res.json(rows));
+    `,
+    [req.user.id, q],
+    (err, rows) => res.json(rows)
+  );
 });
 
-// ------------------------------------------------------------
-// Q2 — Stored XSS + SQLi in feedback insert
-// ------------------------------------------------------------
+/* ---------------- FEEDBACK (SAFE) ---------------- */
+
 app.post("/feedback", auth, (req, res) => {
   const comment = req.body.comment;
-  const userId = req.user.id;
 
-  db.get(`SELECT username FROM users WHERE id = ${userId}`, (err, row) => {
-    const username = row.username;
-
-    const insert = `
-      INSERT INTO feedback (user, comment)
-      VALUES ('${username}', '${comment}')
-    `;
-    db.run(insert, () => {
-      res.json({ success: true });
-    });
+  db.get(`SELECT username FROM users WHERE id = ?`, [req.user.id], (err, row) => {
+    db.run(
+      `INSERT INTO feedback (user, comment) VALUES (?, ?)`,
+      [row.username, comment],
+      () => res.json({ success: true })
+    );
   });
 });
 
@@ -149,23 +185,21 @@ app.get("/feedback", auth, (req, res) => {
   });
 });
 
-// ------------------------------------------------------------
-// Q3 — CSRF + SQLi in email update
-// ------------------------------------------------------------
+/* ---------------- EMAIL CHANGE (SAFE) ---------------- */
+
 app.post("/change-email", auth, (req, res) => {
   const newEmail = req.body.email;
-
   if (!newEmail.includes("@")) return res.status(400).json({ error: "Invalid email" });
 
-  const sql = `
-    UPDATE users SET email = '${newEmail}' WHERE id = ${req.user.id}
-  `;
-  db.run(sql, () => {
-    res.json({ success: true, email: newEmail });
-  });
+  db.run(
+    `UPDATE users SET email = ? WHERE id = ?`,
+    [newEmail, req.user.id],
+    () => res.json({ success: true, email: newEmail })
+  );
 });
 
-// ------------------------------------------------------------
+/* ---------------- START SERVER ---------------- */
+
 app.listen(4000, () =>
-  console.log("FastBank Version A backend running on http://localhost:4000")
+  console.log("FastBank Secure backend running on http://localhost:4000")
 );
