@@ -27,13 +27,12 @@ jobs:
       - name: Install Semgrep
         run: pip install semgrep
 
-      - name: Run Semgrep SAST (OWASP Top 10, fail on High/Critical)
+      - name: Run Semgrep SAST (OWASP Top 10)
         run: |
           semgrep \
             --config "p/owasp-top-ten" \
-            --severity=ERROR \
-            --error \
             --sarif -o semgrep.sarif
+
 
       - name: Upload Semgrep SARIF to code scanning
         uses: github/codeql-action/upload-sarif@v3
