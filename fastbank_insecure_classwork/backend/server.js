@@ -9,10 +9,10 @@ const app = express();
 
 /* ---------------- SECURE GLOBAL HEADERS (FIXES ZAP) ---------------- */
 
-// Remove X-Powered-By leak
+// Hide Express implementation details
 app.disable("x-powered-by");
 
-// No caching (fixes cacheable content alert)
+// No caching (fixes “Non-Storable Content” style alerts)
 app.use((req, res, next) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
   res.setHeader("Pragma", "no-cache");
@@ -20,7 +20,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Content Security Policy with full fallback
+// Strong Content Security Policy with a proper fallback
 app.use((req, res, next) => {
   res.setHeader(
     "Content-Security-Policy",
@@ -29,7 +29,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Permissions Policy header
+// Permissions Policy (formerly Feature-Policy)
 app.use((req, res, next) => {
   res.setHeader(
     "Permissions-Policy",
@@ -50,7 +50,24 @@ app.use(
 app.use(bodyParser.json());
 app.use(cookieParser());
 
-/* ---------------- DB ---------------- */
+/* ---------------- SESSION + HASH HELPERS ---------------- */
+
+const sessions = {};
+
+function fastHash(pwd) {
+  return crypto.createHash("sha256").update(pwd).digest("hex");
+}
+
+function auth(req, res, next) {
+  const sid = req.cookies.sid;
+  if (!sid || !sessions[sid]) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+  req.user = { id: sessions[sid].userId };
+  next();
+}
+
+/* ---------------- IN-MEMORY SQLITE DB ---------------- */
 
 const db = new sqlite3.Database(":memory:");
 
@@ -81,29 +98,24 @@ db.serialize(() => {
     );
   `);
 
-  const passwordHash = crypto.createHash("sha256").update("password123").digest("hex");
+  const passwordHash = fastHash("password123");
 
-  db.run(`INSERT INTO users (username, password_hash, email)
-          VALUES ('alice', ?, ?)`, [passwordHash, "alice@example.com"]);
+  // Parameterised insert to avoid SQL injection
+  db.run(
+    `INSERT INTO users (username, password_hash, email)
+     VALUES ('alice', ?, ?)`,
+    [passwordHash, "alice@example.com"]
+  );
 
-  db.run(`INSERT INTO transactions (user_id, amount, description) VALUES (1, 25.50, 'Coffee shop')`);
-  db.run(`INSERT INTO transactions (user_id, amount, description) VALUES (1, 100, 'Groceries')`);
+  db.run(
+    `INSERT INTO transactions (user_id, amount, description)
+     VALUES (1, 25.50, 'Coffee shop')`
+  );
+  db.run(
+    `INSERT INTO transactions (user_id, amount, description)
+     VALUES (1, 100, 'Groceries')`
+  );
 });
-
-/* ---------------- SESSION STORE ---------------- */
-
-const sessions = {};
-
-function fastHash(pwd) {
-  return crypto.createHash("sha256").update(pwd).digest("hex");
-}
-
-function auth(req, res, next) {
-  const sid = req.cookies.sid;
-  if (!sid || !sessions[sid]) return res.status(401).json({ error: "Not authenticated" });
-  req.user = { id: sessions[sid].userId };
-  next();
-}
 
 /* ---------------- LOGIN (SAFE) ---------------- */
 
@@ -114,19 +126,28 @@ app.post("/login", (req, res) => {
     `SELECT id, username, password_hash FROM users WHERE username = ?`,
     [username],
     (err, user) => {
-      if (!user) return res.status(401).json({ error: "Invalid credentials" });
+      if (err) {
+        console.error("DB error in /login:", err);
+        return res.status(500).json({ error: "Server error" });
+      }
+
+      // Do not leak which part was wrong
+      if (!user) {
+        return res.status(401).json({ error: "Invalid credentials" });
+      }
 
       const candidate = fastHash(password);
       if (candidate !== user.password_hash) {
         return res.status(401).json({ error: "Invalid credentials" });
       }
 
-      const sid = crypto.randomBytes(32).toString("hex"); // secure session
+      // Secure, random session id
+      const sid = crypto.randomBytes(32).toString("hex");
       sessions[sid] = { userId: user.id };
 
       res.cookie("sid", sid, {
         httpOnly: true,
-        secure: false,
+        secure: false, // set to true if you serve over HTTPS
         sameSite: "strict"
       });
 
@@ -142,6 +163,10 @@ app.get("/me", auth, (req, res) => {
     "SELECT username, email FROM users WHERE id = ?",
     [req.user.id],
     (err, row) => {
+      if (err) {
+        console.error("DB error in /me:", err);
+        return res.status(500).json({ error: "Server error" });
+      }
       res.json(row);
     }
   );
@@ -161,7 +186,13 @@ app.get("/transactions", auth, (req, res) => {
     ORDER BY id DESC
     `,
     [req.user.id, q],
-    (err, rows) => res.json(rows)
+    (err, rows) => {
+      if (err) {
+        console.error("DB error in /transactions:", err);
+        return res.status(500).json({ error: "Server error" });
+      }
+      res.json(rows);
+    }
   );
 });
 
@@ -170,36 +201,66 @@ app.get("/transactions", auth, (req, res) => {
 app.post("/feedback", auth, (req, res) => {
   const comment = req.body.comment;
 
-  db.get(`SELECT username FROM users WHERE id = ?`, [req.user.id], (err, row) => {
-    db.run(
-      `INSERT INTO feedback (user, comment) VALUES (?, ?)`,
-      [row.username, comment],
-      () => res.json({ success: true })
-    );
-  });
+  db.get(
+    `SELECT username FROM users WHERE id = ?`,
+    [req.user.id],
+    (err, row) => {
+      if (err || !row) {
+        console.error("DB error in /feedback (get user):", err);
+        return res.status(500).json({ error: "Server error" });
+      }
+
+      db.run(
+        `INSERT INTO feedback (user, comment) VALUES (?, ?)`,
+        [row.username, comment],
+        (err2) => {
+          if (err2) {
+            console.error("DB error in /feedback (insert):", err2);
+            return res.status(500).json({ error: "Server error" });
+          }
+          res.json({ success: true });
+        }
+      );
+    }
+  );
 });
 
 app.get("/feedback", auth, (req, res) => {
-  db.all("SELECT user, comment FROM feedback ORDER BY id DESC", (err, rows) => {
-    res.json(rows);
-  });
+  db.all(
+    "SELECT user, comment FROM feedback ORDER BY id DESC",
+    (err, rows) => {
+      if (err) {
+        console.error("DB error in GET /feedback:", err);
+        return res.status(500).json({ error: "Server error" });
+      }
+      res.json(rows);
+    }
+  );
 });
 
 /* ---------------- EMAIL CHANGE (SAFE) ---------------- */
 
 app.post("/change-email", auth, (req, res) => {
   const newEmail = req.body.email;
-  if (!newEmail.includes("@")) return res.status(400).json({ error: "Invalid email" });
+  if (!newEmail || !newEmail.includes("@")) {
+    return res.status(400).json({ error: "Invalid email" });
+  }
 
   db.run(
     `UPDATE users SET email = ? WHERE id = ?`,
     [newEmail, req.user.id],
-    () => res.json({ success: true, email: newEmail })
+    (err) => {
+      if (err) {
+        console.error("DB error in /change-email:", err);
+        return res.status(500).json({ error: "Server error" });
+      }
+      res.json({ success: true, email: newEmail });
+    }
   );
 });
 
 /* ---------------- START SERVER ---------------- */
 
-app.listen(4000, () =>
-  console.log("FastBank Secure backend running on http://localhost:4000")
-);
+app.listen(4000, () => {
+  console.log("FastBank Secure backend running on http://localhost:4000");
+});
